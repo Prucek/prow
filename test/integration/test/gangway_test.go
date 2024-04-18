@@ -222,3 +222,71 @@ this-is-from-repoTestGangway1
 		})
 	}
 }
+
+func TestGangwayBulkJobStatusChange(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name        string
+		bulkMsg     *gangway.BulkJobStatusChangeRequest
+		creationMsg *gangway.CreateJobExecutionRequest
+	}{
+		{
+			name: "bulk-job-status-change",
+			bulkMsg: &gangway.BulkJobStatusChangeRequest{
+				JobStatusChange: &gangway.JobStatusChange{
+					Current: gangway.JobExecutionStatus_PENDING,
+					Desired: gangway.JobExecutionStatus_ABORTED,
+				},
+			},
+			creationMsg: &gangway.CreateJobExecutionRequest{
+				JobName:          "trigger-mainconfig-periodic-via-gangway1",
+				JobExecutionType: gangway.JobExecutionType_PERIODIC,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			c, err := gangwayGoogleClient.NewInsecure(":32000", "123")
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			defer c.Close()
+
+			ctx := context.Background()
+			ctx = c.EmbedProjectNumber(ctx)
+
+			// Use Prow API to create the job through gangway. This is a gRPC
+			// call.
+			for i := 0; i < 3; i++ {
+				jobExecution, err := c.GRPC.CreateJobExecution(ctx, tt.creationMsg)
+				if err != nil {
+					t.Fatalf("Failed to create job execution: %v", err)
+				}
+				fmt.Println(jobExecution)
+
+				// We expect the job to have succeeded.
+				timeout := 120 * time.Second
+				pollInterval := 500 * time.Millisecond
+				expectedStatus := gangway.JobExecutionStatus_SUCCESS
+
+				if err := c.WaitForJobExecutionStatus(ctx, jobExecution.Id, pollInterval, timeout, expectedStatus); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			jobsAffected, err := c.GRPC.BulkJobStatusChange(ctx, tt.bulkMsg)
+			if err != nil {
+				t.Fatalf("Failed to bulk change job status: %v", err)
+			}
+			if jobsAffected.Count != 3 {
+				t.Fatalf("Expected 3 jobs to be affected, got %d", jobsAffected.Count)
+			}
+		})
+	}
+
+}
