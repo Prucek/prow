@@ -54,6 +54,8 @@ type Gangway struct {
 type ProwJobClient interface {
 	Create(context.Context, *prowcrd.ProwJob, metav1.CreateOptions) (*prowcrd.ProwJob, error)
 	Get(context.Context, string, metav1.GetOptions) (*prowcrd.ProwJob, error)
+	List(context.Context, metav1.ListOptions) (*prowcrd.ProwJobList, error)
+	UpdateStatus(context.Context, *prowcrd.ProwJob, metav1.UpdateOptions) (*prowcrd.ProwJob, error)
 }
 
 // CreateJobExecution triggers a new Prow job.
@@ -115,10 +117,19 @@ func (gw *Gangway) GetJobExecution(ctx context.Context, gjer *GetJobExecutionReq
 		return nil, err
 	}
 
+	jobExec := &JobExecution{
+		Id:        prowJobCR.Name,
+		JobStatus: TranslateProwJobStatus(&prowJobCR.Status),
+	}
+
+	return jobExec, nil
+}
+
+// Translate ProwJobStatus.State in the Prow Job CR into a JobExecutionStatus.
+func TranslateProwJobStatus(prowJobStatus *prowcrd.ProwJobStatus) JobExecutionStatus {
 	var jobStatus JobExecutionStatus
 
-	// Translate ProwJobStatus.State in the Prow Job CR into a JobExecutionStatus.
-	switch prowJobCR.Status.State {
+	switch prowJobStatus.State {
 	case prowcrd.TriggeredState:
 		jobStatus = JobExecutionStatus_TRIGGERED
 	case prowcrd.PendingState:
@@ -135,13 +146,144 @@ func (gw *Gangway) GetJobExecution(ctx context.Context, gjer *GetJobExecutionReq
 		jobStatus = JobExecutionStatus_JOB_EXECUTION_STATUS_UNSPECIFIED
 
 	}
+	return jobStatus
+}
 
-	jobExec := &JobExecution{
-		Id:        prowJobCR.Name,
-		JobStatus: jobStatus,
+// Translate ProwjobType into JobExecutionType
+func TranslateProwJobType(prowJobType prowcrd.ProwJobType) JobExecutionType {
+	var jobExecutionType JobExecutionType
+
+	switch prowJobType {
+	case prowcrd.PeriodicJob:
+		jobExecutionType = JobExecutionType_PERIODIC
+	case prowcrd.PostsubmitJob:
+		jobExecutionType = JobExecutionType_POSTSUBMIT
+	case prowcrd.PresubmitJob:
+		jobExecutionType = JobExecutionType_PRESUBMIT
+	case prowcrd.BatchJob:
+		jobExecutionType = JobExecutionType_BATCH
+	default:
+		jobExecutionType = JobExecutionType_JOB_EXECUTION_TYPE_UNSPECIFIED
+	}
+	return jobExecutionType
+}
+
+func (gw *Gangway) BulkJobStatusChange(ctx context.Context, request *BulkJobStatusChangeRequest) (*JobsAffected, error) {
+
+	err, md := getHttpRequestHeaders(ctx)
+	if err != nil {
+		logrus.WithError(err).Debug("could not find request HTTP headers")
+		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 
-	return jobExec, nil
+	if err := request.Validate(); err != nil {
+		logrus.WithError(err).Debug("could not validate request fields")
+		return nil, err
+	}
+
+	mainConfig := gw.ConfigAgent.Config()
+	allowedApiClient, err := mainConfig.IdentifyAllowedClient(md)
+	if err != nil {
+		logrus.WithError(err).Debug("could not find client in allowlist")
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+
+	pjList, err := gw.ProwJobClient.List(ctx, metav1.ListOptions{})
+	if err != nil {
+		logrus.WithError(err).Debug("failed to list ProwJobs")
+		return nil, err
+	}
+
+	jobExecutions := &JobExecutions{}
+	var count int32
+	for _, pj := range pjList.Items {
+		if !isMatchingCondition(pj, request) {
+			continue
+		}
+		if allowedApiClient != nil {
+			authorized := ClientAuthorized(allowedApiClient, pj)
+
+			if !authorized {
+				logrus.Error("client is not authorized to execute the given job")
+				return nil, status.Error(codes.PermissionDenied, "client is not authorized to execute the given job")
+			}
+		}
+		pj.Status.State = prowcrd.ProwJobState(request.GetJobStatusChange().GetDesired())
+
+		logrus.WithField("name", pj.Name).Info("updating ProwJob status")
+		updatedPj, err := gw.ProwJobClient.UpdateStatus(ctx, &pj, metav1.UpdateOptions{})
+		if err != nil {
+			logrus.WithError(err).Debug("failed to update ProwJob status")
+			continue
+		}
+
+		jobExec := &JobExecution{
+			Id:        updatedPj.Name,
+			JobName:   updatedPj.Spec.Job,
+			JobType:   JobExecutionType(TranslateProwJobType(updatedPj.Spec.Type)),
+			JobStatus: TranslateProwJobStatus(&updatedPj.Status),
+		}
+		jobExecutions.JobExecution = append(jobExecutions.JobExecution, jobExec)
+		count++
+	}
+
+	// If more than n jobs were affected, we only return the first n jobs
+	// because we don't want to return a huge list of jobs and wait for a long time
+	n := int32(10)
+	if count > n {
+		jobExecutions.JobExecution = jobExecutions.JobExecution[:n]
+	}
+	jobsAffected := &JobsAffected{
+		Count:         count,
+		JobExecutions: jobExecutions,
+	}
+	return jobsAffected, nil
+}
+
+func isMatchingCondition(pj prowcrd.ProwJob, request *BulkJobStatusChangeRequest) bool {
+	pjStateString := strings.ToLower(request.GetJobStatusChange().GetCurrent().String())
+	pjCluster := request.GetCluster()
+	pjTypeString := request.GetJobType().String()
+	pjRefs := request.GetRefs()
+	startedBefore := request.GetStartedBefore()
+	startedAfter := request.GetStartedAfter()
+
+	if pj.Status.State != prowcrd.ProwJobState(pjStateString) {
+		return false
+	}
+	if pjCluster != "" {
+		if pj.Spec.Cluster != pjCluster {
+			return false
+		}
+	}
+	if pjTypeString != "JOB_EXECUTION_TYPE_UNSPECIFIED" {
+		if pj.Spec.Type != prowcrd.ProwJobType(pjTypeString) {
+			return false
+		}
+	}
+	if startedBefore != nil {
+		if pj.Status.StartTime.Time.After(startedBefore.AsTime()) {
+			return false
+		}
+	}
+	if startedAfter != nil {
+		if pj.Status.StartTime.Time.Before(startedAfter.AsTime()) {
+			return false
+		}
+	}
+	if pjRefs != nil {
+		if pjRefs.GetOrg() != "" {
+			if pjRefs.GetOrg() != pj.Spec.Refs.Org {
+				return false
+			}
+		}
+		if pjRefs.GetRepo() != "" {
+			if pjRefs.GetRepo() != pj.Spec.Refs.Repo {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // ClientAuthorized checks whether or not a client can run a Prow job based on
@@ -346,6 +488,17 @@ func (cjer *CreateJobExecutionRequest) Validate() error {
 		}
 	}
 
+	return nil
+}
+
+func (bjscr *BulkJobStatusChangeRequest) Validate() error {
+
+	if bjscr.GetJobStatusChange().GetCurrent() == JobExecutionStatus_JOB_EXECUTION_STATUS_UNSPECIFIED {
+		return errors.New("current status is unspecified")
+	}
+	if bjscr.GetJobStatusChange().GetDesired() == JobExecutionStatus_JOB_EXECUTION_STATUS_UNSPECIFIED {
+		return errors.New("desired status is unspecified")
+	}
 	return nil
 }
 
