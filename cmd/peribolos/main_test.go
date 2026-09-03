@@ -168,13 +168,17 @@ func TestOptions(t *testing.T) {
 }
 
 type fakeClient struct {
-	orgMembers sets.Set[string]
-	admins     sets.Set[string]
-	invitees   sets.Set[string]
-	members    sets.Set[string]
-	removed    sets.Set[string]
-	newAdmins  sets.Set[string]
-	newMembers sets.Set[string]
+	orgMembers      sets.Set[string]
+	admins          sets.Set[string]
+	invitees        sets.Set[string]
+	failedInvites   map[string][]int // login -> invitation IDs
+	deletedInvites  []int
+	members         sets.Set[string]
+	removed         sets.Set[string]
+	newAdmins       sets.Set[string]
+	newMembers      sets.Set[string]
+	teams           []github.Team
+	enterpriseTeams map[string][]github.TeamMember // slug -> members
 }
 
 func (c *fakeClient) BotUser() (*github.UserData, error) {
@@ -216,6 +220,31 @@ func (c *fakeClient) ListOrgInvitations(org string) ([]github.OrgInvitation, err
 	return ret, nil
 }
 
+func (c *fakeClient) ListFailedOrgInvitations(org string) ([]github.OrgInvitation, error) {
+	var ret []github.OrgInvitation
+	for login, ids := range c.failedInvites {
+		if login == "fail-list" {
+			return nil, errors.New("injected list failed org invitations failure")
+		}
+		for _, id := range ids {
+			ret = append(ret, github.OrgInvitation{
+				TeamMember:   github.TeamMember{Login: login},
+				ID:           id,
+				FailedReason: "2fa_required",
+			})
+		}
+	}
+	return ret, nil
+}
+
+func (c *fakeClient) DeleteOrgInvitation(org string, invitationID int) error {
+	if invitationID == -1 {
+		return errors.New("injected delete org invitation failure")
+	}
+	c.deletedInvites = append(c.deletedInvites, invitationID)
+	return nil
+}
+
 func (c *fakeClient) RemoveOrgMembership(org, user string) error {
 	if user == "fail" {
 		return errors.New("injected remove org membership failure")
@@ -254,7 +283,19 @@ func (c *fakeClient) UpdateOrgMembership(org, user string, admin bool) (*github.
 	}, nil
 }
 
+func (c *fakeClient) ListTeams(org string) ([]github.Team, error) {
+	for _, t := range c.teams {
+		if t.Name == "list-teams-fail" {
+			return nil, fmt.Errorf("injected ListTeams error")
+		}
+	}
+	return c.teams, nil
+}
+
 func (c *fakeClient) ListTeamMembersBySlug(org, teamSlug, role string) ([]github.TeamMember, error) {
+	if members, ok := c.enterpriseTeams[teamSlug]; ok {
+		return members, nil
+	}
 	if teamSlug != configuredTeamSlug {
 		return nil, fmt.Errorf("only team: %s supported, not %s", configuredTeamSlug, teamSlug)
 	}
@@ -478,16 +519,20 @@ func TestConfigureMembers(t *testing.T) {
 
 func TestConfigureOrgMembers(t *testing.T) {
 	cases := []struct {
-		name        string
-		opt         options
-		config      org.Config
-		admins      []string
-		members     []string
-		invitations []string
-		err         bool
-		remove      []string
-		addAdmins   []string
-		addMembers  []string
+		name            string
+		opt             options
+		config          org.Config
+		admins          []string
+		members         []string
+		invitations     []string
+		failedInvites   map[string][]int
+		teams           []github.Team
+		enterpriseTeams map[string][]github.TeamMember
+		err             bool
+		remove          []string
+		addAdmins       []string
+		addMembers      []string
+		deletedInvites  []int
 	}{
 		{
 			name: "too few admins",
@@ -652,19 +697,135 @@ func TestConfigureOrgMembers(t *testing.T) {
 			},
 			invitations: []string{"invited-admin", "invited-member"},
 		},
+		{
+			name: "enterprise team members excluded from removal",
+			config: org.Config{
+				Admins:  []string{"keep-admin"},
+				Members: []string{"keep-member"},
+			},
+			opt: options{
+				maximumDelta:          0.5,
+				ignoreEnterpriseTeams: true,
+			},
+			admins:  []string{"keep-admin", "ent-user"},
+			members: []string{"keep-member", "ent-user2"},
+			teams: []github.Team{
+				{Name: "org-team", Slug: "org-team", Type: "organization"},
+				{Name: "ent-security", Slug: "ent-security", Type: github.TeamTypeEnterprise},
+			},
+			enterpriseTeams: map[string][]github.TeamMember{
+				"ent-security": {{Login: "ent-user"}, {Login: "ent-user2"}},
+			},
+		},
+		{
+			name: "enterprise team members not excluded without flag",
+			config: org.Config{
+				Admins:  []string{"keep-admin"},
+				Members: []string{"keep-member"},
+			},
+			opt: options{
+				maximumDelta: 0.5,
+			},
+			admins:  []string{"keep-admin", "ent-user"},
+			members: []string{"keep-member"},
+			remove:  []string{"ent-user"},
+		},
+		{
+			name: "enterprise member also in config is kept with configured role",
+			config: org.Config{
+				Admins:  []string{"keep-admin"},
+				Members: []string{"keep-member", "ent-user"},
+			},
+			opt: options{
+				maximumDelta:          0.5,
+				ignoreEnterpriseTeams: true,
+			},
+			admins:  []string{"keep-admin", "ent-user"},
+			members: []string{"keep-member"},
+			teams: []github.Team{
+				{Name: "ent-security", Slug: "ent-security", Type: github.TeamTypeEnterprise},
+			},
+			enterpriseTeams: map[string][]github.TeamMember{
+				"ent-security": {{Login: "ent-user"}},
+			},
+			addMembers: []string{"ent-user"},
+		},
+		{
+			name: "ListTeams error fails configureOrgMembers",
+			config: org.Config{
+				Admins:  []string{"keep-admin"},
+				Members: []string{"keep-member"},
+			},
+			opt: options{
+				maximumDelta:          0.5,
+				ignoreEnterpriseTeams: true,
+			},
+			admins:  []string{"keep-admin"},
+			members: []string{"keep-member"},
+			teams: []github.Team{
+				{Name: "list-teams-fail"},
+			},
+			err: true,
+		},
+		{
+			name: "delete failed invite then re-invite",
+			config: org.Config{
+				Members: []string{"reinvite-me"},
+			},
+			failedInvites:  map[string][]int{"reinvite-me": {42}},
+			addMembers:     []string{"reinvite-me"},
+			deletedInvites: []int{42},
+		},
+		{
+			name: "delete all failed invites for same user then re-invite",
+			config: org.Config{
+				Members: []string{"reinvite-me"},
+			},
+			failedInvites:  map[string][]int{"reinvite-me": {42, 43}},
+			addMembers:     []string{"reinvite-me"},
+			deletedInvites: []int{42, 43},
+		},
+		{
+			name: "delete failed invite for admin role",
+			config: org.Config{
+				Admins: []string{"reinvite-admin"},
+			},
+			failedInvites:  map[string][]int{"reinvite-admin": {55}},
+			addAdmins:      []string{"reinvite-admin"},
+			deletedInvites: []int{55},
+		},
+		{
+			name: "delete failed invite failure still re-invites user",
+			config: org.Config{
+				Members: []string{"bad-delete"},
+			},
+			failedInvites: map[string][]int{"bad-delete": {-1}},
+			addMembers:    []string{"bad-delete"},
+		},
+		{
+			name: "pending invite takes precedence over failed invite",
+			config: org.Config{
+				Members: []string{"pending-and-failed"},
+			},
+			invitations:   []string{"pending-and-failed"},
+			failedInvites: map[string][]int{"pending-and-failed": {99}},
+		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			fc := &fakeClient{
-				admins:     sets.New[string](tc.admins...),
-				members:    sets.New[string](tc.members...),
-				removed:    sets.Set[string]{},
-				newAdmins:  sets.Set[string]{},
-				newMembers: sets.Set[string]{},
+				admins:          sets.New[string](tc.admins...),
+				members:         sets.New[string](tc.members...),
+				removed:         sets.Set[string]{},
+				newAdmins:       sets.Set[string]{},
+				newMembers:      sets.Set[string]{},
+				teams:           tc.teams,
+				enterpriseTeams: tc.enterpriseTeams,
+				failedInvites:   tc.failedInvites,
 			}
 
-			err := configureOrgMembers(tc.opt, fc, fakeOrg, tc.config, sets.New[string](tc.invitations...))
+			err := configureOrgMembers(tc.opt, fc, fakeOrg, tc.config, sets.New[string](tc.invitations...), tc.failedInvites)
 			switch {
 			case err != nil:
 				if !tc.err {
@@ -679,10 +840,21 @@ func TestConfigureOrgMembers(t *testing.T) {
 					t.Errorf("Wrong members added: %v", err)
 				} else if err := cmpLists(tc.addAdmins, sets.List(fc.newAdmins)); err != nil {
 					t.Errorf("Wrong admins added: %v", err)
+				} else if err := cmpLists(intSliceToString(tc.deletedInvites), intSliceToString(fc.deletedInvites)); err != nil {
+					t.Errorf("Wrong invitations deleted: %v", err)
 				}
 			}
 		})
 	}
+}
+
+func intSliceToString(ints []int) []string {
+	var out []string
+	for _, i := range ints {
+		out = append(out, fmt.Sprintf("%d", i))
+	}
+	sort.Strings(out)
+	return out
 }
 
 type fakeTeamClient struct {
@@ -840,15 +1012,16 @@ func TestConfigureTeams(t *testing.T) {
 	desc := "so interesting"
 	priv := org.Secret
 	cases := []struct {
-		name              string
-		err               bool
-		orgNameOverride   string
-		ignoreSecretTeams bool
-		config            org.Config
-		teams             []github.Team
-		expected          map[string]github.Team
-		deleted           []string
-		delta             float64
+		name                  string
+		err                   bool
+		orgNameOverride       string
+		ignoreSecretTeams     bool
+		ignoreEnterpriseTeams bool
+		config                org.Config
+		teams                 []github.Team
+		expected              map[string]github.Team
+		deleted               []string
+		delta                 float64
 	}{
 		{
 			name: "do nothing without error",
@@ -1036,6 +1209,42 @@ func TestConfigureTeams(t *testing.T) {
 			deleted:  []string{"closed"},
 			delta:    1,
 		},
+		{
+			name:                  "skip enterprise teams when flag is set",
+			ignoreEnterpriseTeams: true,
+			teams: []github.Team{
+				{
+					Name: "org-team",
+					Slug: "org-team",
+					ID:   1,
+				},
+				{
+					Name: "ent-security",
+					Slug: "ent-security",
+					ID:   2,
+					Type: github.TeamTypeEnterprise,
+				},
+			},
+			config:   org.Config{Teams: map[string]org.Team{}},
+			expected: map[string]github.Team{},
+			deleted:  []string{"org-team"},
+			delta:    1,
+		},
+		{
+			name: "enterprise teams treated as normal without flag",
+			teams: []github.Team{
+				{
+					Name: "ent-security",
+					Slug: "ent-security",
+					ID:   2,
+					Type: github.TeamTypeEnterprise,
+				},
+			},
+			config:   org.Config{Teams: map[string]org.Team{}},
+			expected: map[string]github.Team{},
+			deleted:  []string{"ent-security"},
+			delta:    1,
+		},
 	}
 
 	for _, tc := range cases {
@@ -1051,7 +1260,7 @@ func TestConfigureTeams(t *testing.T) {
 			if tc.delta == 0 {
 				tc.delta = 1
 			}
-			actual, err := configureTeams(fc, orgName, tc.config, tc.delta, tc.ignoreSecretTeams)
+			actual, err := configureTeams(fc, orgName, tc.config, tc.delta, tc.ignoreSecretTeams, tc.ignoreEnterpriseTeams)
 			switch {
 			case err != nil:
 				if !tc.err {
@@ -1729,19 +1938,20 @@ func TestDumpOrgConfig(t *testing.T) {
 	repoHomepage := "https://www.somewhe.re/something/"
 	master := "master-branch"
 	cases := []struct {
-		name              string
-		orgOverride       string
-		ignoreSecretTeams bool
-		meta              github.Organization
-		members           []string
-		admins            []string
-		teams             []github.Team
-		teamMembers       map[string][]string
-		maintainers       map[string][]string
-		repoPermissions   map[string][]github.Repo
-		repos             []github.FullRepo
-		expected          org.Config
-		err               bool
+		name                  string
+		orgOverride           string
+		ignoreSecretTeams     bool
+		ignoreEnterpriseTeams bool
+		meta                  github.Organization
+		members               []string
+		admins                []string
+		teams                 []github.Team
+		teamMembers           map[string][]string
+		maintainers           map[string][]string
+		repoPermissions       map[string][]github.Repo
+		repos                 []github.FullRepo
+		expected              org.Config
+		err                   bool
 	}{
 		{
 			name:        "fails if GetOrg fails",
@@ -2026,6 +2236,69 @@ func TestDumpOrgConfig(t *testing.T) {
 				Repos:   map[string]org.Repo{},
 			},
 		},
+		{
+			name:                  "skips enterprise teams when flag is set",
+			ignoreEnterpriseTeams: true,
+			meta: github.Organization{
+				Name:                         hello,
+				MembersCanCreateRepositories: yes,
+				DefaultRepositoryPermission:  string(perm),
+			},
+			members: []string{"george"},
+			admins:  []string{"admin"},
+			teams: []github.Team{
+				{
+					ID:          5,
+					Slug:        "team-5",
+					Name:        "friends",
+					Description: details,
+				},
+				{
+					ID:   9,
+					Slug: "ent-security",
+					Name: "ent-security",
+					Type: github.TeamTypeEnterprise,
+				},
+			},
+			teamMembers: map[string][]string{
+				"team-5": {"george"},
+			},
+			maintainers: map[string][]string{
+				"team-5": {},
+			},
+			repoPermissions: map[string][]github.Repo{
+				"team-5": {},
+			},
+			expected: org.Config{
+				Metadata: org.Metadata{
+					Name:                         &hello,
+					BillingEmail:                 &empty,
+					Company:                      &empty,
+					Email:                        &empty,
+					Description:                  &empty,
+					Location:                     &empty,
+					HasOrganizationProjects:      &no,
+					HasRepositoryProjects:        &no,
+					DefaultRepositoryPermission:  &perm,
+					MembersCanCreateRepositories: &yes,
+				},
+				Teams: map[string]org.Team{
+					"friends": {
+						TeamMetadata: org.TeamMetadata{
+							Description: &details,
+							Privacy:     &pub,
+						},
+						Members:     []string{"george"},
+						Maintainers: []string{},
+						Children:    map[string]org.Team{},
+						Repos:       map[string]github.RepoPermissionLevel{},
+					},
+				},
+				Members: []string{"george"},
+				Admins:  []string{"admin"},
+				Repos:   map[string]org.Repo{},
+			},
+		},
 	}
 
 	for _, tc := range cases {
@@ -2045,7 +2318,7 @@ func TestDumpOrgConfig(t *testing.T) {
 				repoPermissions: tc.repoPermissions,
 				repos:           tc.repos,
 			}
-			actual, err := dumpOrgConfig(fc, orgName, tc.ignoreSecretTeams, "")
+			actual, err := dumpOrgConfig(fc, orgName, tc.ignoreSecretTeams, tc.ignoreEnterpriseTeams, "")
 			switch {
 			case err != nil:
 				if !tc.err {
@@ -2265,6 +2538,82 @@ func TestOrgInvitations(t *testing.T) {
 				invitees: tc.invitees,
 			}
 			actual, err := orgInvitations(tc.opt, fc, "random-org")
+			switch {
+			case err != nil:
+				if !tc.err {
+					t.Errorf("unexpected error: %v", err)
+				}
+			case tc.err:
+				t.Errorf("failed to receive an error")
+			case !reflect.DeepEqual(actual, tc.expected):
+				t.Errorf("%#v != expected %#v", actual, tc.expected)
+			}
+		})
+	}
+}
+
+func TestOrgFailedInvitations(t *testing.T) {
+	cases := []struct {
+		name          string
+		opt           options
+		failedInvites map[string][]int
+		expected      map[string][]int
+		err           bool
+	}{
+		{
+			name:          "skip when fixOrgMembers is false",
+			failedInvites: map[string][]int{"him": {1}, "her": {2}},
+			expected:      nil,
+		},
+		{
+			name: "skip when ignoreInvitees is set",
+			opt: options{
+				fixOrgMembers:  true,
+				ignoreInvitees: true,
+			},
+			failedInvites: map[string][]int{"him": {1}},
+			expected:      nil,
+		},
+		{
+			name: "returns failed invitations when fixOrgMembers",
+			opt: options{
+				fixOrgMembers: true,
+			},
+			failedInvites: map[string][]int{"him": {1}, "her": {2}},
+			expected:      map[string][]int{"him": {1}, "her": {2}},
+		},
+		{
+			name: "collects multiple failed invitations for same user",
+			opt: options{
+				fixOrgMembers: true,
+			},
+			failedInvites: map[string][]int{"him": {1, 2}},
+			expected:      map[string][]int{"him": {1, 2}},
+		},
+		{
+			name: "normalizes login case",
+			opt: options{
+				fixOrgMembers: true,
+			},
+			failedInvites: map[string][]int{"MiXeD": {3}, "UPPER": {4}},
+			expected:      map[string][]int{"mixed": {3}, "upper": {4}},
+		},
+		{
+			name: "error if list fails",
+			opt: options{
+				fixOrgMembers: true,
+			},
+			failedInvites: map[string][]int{"fail-list": {0}},
+			err:           true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fc := &fakeClient{
+				failedInvites: tc.failedInvites,
+			}
+			actual, err := orgFailedInvitations(tc.opt, fc, "random-org")
 			switch {
 			case err != nil:
 				if !tc.err {

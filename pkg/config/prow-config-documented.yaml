@@ -65,6 +65,8 @@ branch-protection:
                             # RequireManuallyTriggeredJobs enforces a context presence when job runs conditionally, but not automatically,
                             # that results in params always_run: false, optional: false, and skip_if_only_change, run_if_changed not present.
                             require_manually_triggered_jobs: false
+                            # RequireSignedCommits requires all commits pushed to the branch to be signed with a verified signature.
+                            require_signed_commits: false
                             # RequiredLinearHistory enforces a linear commit Git history, which prevents anyone from pushing merge commits to a branch.
                             required_linear_history: false
                             # RequiredPullRequestReviews specifies github approval/review criteria.
@@ -119,6 +121,8 @@ branch-protection:
                     # RequireManuallyTriggeredJobs enforces a context presence when job runs conditionally, but not automatically,
                     # that results in params always_run: false, optional: false, and skip_if_only_change, run_if_changed not present.
                     require_manually_triggered_jobs: false
+                    # RequireSignedCommits requires all commits pushed to the branch to be signed with a verified signature.
+                    require_signed_commits: false
                     # RequiredLinearHistory enforces a linear commit Git history, which prevents anyone from pushing merge commits to a branch.
                     required_linear_history: false
                     # RequiredPullRequestReviews specifies github approval/review criteria.
@@ -161,6 +165,8 @@ branch-protection:
             # RequireManuallyTriggeredJobs enforces a context presence when job runs conditionally, but not automatically,
             # that results in params always_run: false, optional: false, and skip_if_only_change, run_if_changed not present.
             require_manually_triggered_jobs: false
+            # RequireSignedCommits requires all commits pushed to the branch to be signed with a verified signature.
+            require_signed_commits: false
             # RequiredLinearHistory enforces a linear commit Git history, which prevents anyone from pushing merge commits to a branch.
             required_linear_history: false
             # RequiredPullRequestReviews specifies github approval/review criteria.
@@ -212,6 +218,8 @@ branch-protection:
     # RequireManuallyTriggeredJobs enforces a context presence when job runs conditionally, but not automatically,
     # that results in params always_run: false, optional: false, and skip_if_only_change, run_if_changed not present.
     require_manually_triggered_jobs: false
+    # RequireSignedCommits requires all commits pushed to the branch to be signed with a verified signature.
+    require_signed_commits: false
     # RequiredLinearHistory enforces a linear commit Git history, which prevents anyone from pushing merge commits to a branch.
     required_linear_history: false
     # RequiredPullRequestReviews specifies github approval/review criteria.
@@ -1574,6 +1582,13 @@ tide:
               org: ' '
               repos:
                 - ""
+    # GitHubMergeBlocksPolicyMap configures on org or org/repo level how Tide should handle
+    # GitHub's mergeStateStatus (BLOCKED state from branch protection rules, rulesets,
+    # required reviews, etc.).
+    # Use '*' as key to set this globally. Defaults to "permit" which allows merging but logs warnings.
+    # Valid values: "ignore", "permit", "block"
+    github_merge_blocks_policy:
+        "": ""
     # A key/value pair of an org/repo as the key and Go template to override
     # the default merge commit title and/or message. Template is passed the
     # PullRequest struct (prow/github/types.go#PullRequest)

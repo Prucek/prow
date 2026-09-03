@@ -97,6 +97,7 @@ type Configuration struct {
 	Welcome              []Welcome                    `json:"welcome,omitempty"`
 	Override             Override                     `json:"override,omitempty"`
 	Help                 Help                         `json:"help,omitempty"`
+	InvalidCommitMsg     []InvalidCommitMsg           `json:"invalid_commit_msg,omitempty"`
 }
 
 type Help struct {
@@ -116,6 +117,37 @@ func (h *Help) setDefaults() {
 	if h.HelpGuidelinesURL == "" {
 		h.HelpGuidelinesURL = "https://git.k8s.io/community/contributors/guide/help-wanted.md"
 	}
+}
+
+// InvalidCommitMsg is config for the invalidcommitmsg plugin.
+type InvalidCommitMsg struct {
+	// Repos is either of the form org/repos or just org.
+	Repos []string `json:"repos,omitempty"`
+	// Checks is a list of check configurations.
+	// Each check can be individually enabled or disabled.
+	Checks []InvalidCommitMsgCheck `json:"checks,omitempty"`
+}
+
+// InvalidCommitMsgCheck represents a single check configuration.
+type InvalidCommitMsgCheck struct {
+	// Name is the name of the check (e.g., "fixupPrefix", "issueClosingKeywords").
+	Name string `json:"name"`
+	// Disabled indicates whether this check should be skipped.
+	Disabled bool `json:"disabled,omitempty"`
+}
+
+func (i InvalidCommitMsg) getRepos() []string {
+	return i.Repos
+}
+
+// IsCheckDisabled returns true if the named check is disabled in the configuration.
+func (i *InvalidCommitMsg) IsCheckDisabled(checkName string) bool {
+	for _, check := range i.Checks {
+		if check.Name == checkName {
+			return check.Disabled
+		}
+	}
+	return false
 }
 
 // Golint holds configuration for the golint plugin
@@ -479,6 +511,43 @@ type AssignOnLabel struct {
 	Label string `json:"label"`
 }
 
+// ProminentOrgInviteConfig holds configuration for the prominent org invite
+// message shown to non-org members who have contributed multiple merged PRs.
+type ProminentOrgInviteConfig struct {
+	// Disabled disables the prominent org invite functionality entirely.
+	// When true, only the regular "join the org" message is shown without
+	// querying for merged PRs.
+	Disabled bool `json:"disabled,omitempty"`
+	// MergedPRThreshold is the number of merged PRs after which the user gets
+	// a prominent message about joining the org. Default: 3.
+	// Use a pointer so that we can distinguish between "not set" (use default)
+	// and "explicitly set to 0".
+	MergedPRThreshold *int `json:"merged_pr_threshold,omitempty"`
+	// Message is a custom message template for the prominent org invite.
+	// Supports {join_org_url} as a placeholder for the org join URL.
+	// Default: ">[!TIP]\n>**We noticed you've done this a few times! Consider [joining the org]({join_org_url}) ..."
+	Message string `json:"message,omitempty"`
+}
+
+// EffectiveMergedPRThreshold returns the configured merged PR threshold,
+// or the default of 3 when not configured.
+func (c ProminentOrgInviteConfig) EffectiveMergedPRThreshold() int {
+	if c.MergedPRThreshold != nil {
+		return *c.MergedPRThreshold
+	}
+	return 3
+}
+
+// OrgInviteConfig holds configuration for the org invite functionality
+// that is shown to non-org members when they open a PR.
+// Future top-level fields (e.g. disabled, message) may be added here to
+// control the regular (non-prominent) invitation as well.
+type OrgInviteConfig struct {
+	// Prominent configures the prominent org invite message shown to
+	// non-org members who have contributed multiple merged PRs.
+	Prominent ProminentOrgInviteConfig `json:"prominent,omitzero"`
+}
+
 // Trigger specifies a configuration for a single trigger.
 //
 // The configuration for the trigger plugin is defined as a list of these structures.
@@ -507,6 +576,9 @@ type Trigger struct {
 	IgnoreOkToTest bool `json:"ignore_ok_to_test,omitempty"`
 	// TriggerGitHubWorkflows enables workflows run by github to be triggered by prow.
 	TriggerGitHubWorkflows bool `json:"trigger_github_workflows,omitempty"`
+	// OrgInvite holds configuration for the org invite message
+	// shown to non-org members when they open a PR.
+	OrgInvite OrgInviteConfig `json:"org_invite,omitzero"`
 }
 
 // Heart contains the configuration for the heart plugin.
@@ -1054,6 +1126,28 @@ func (c *Configuration) DcoFor(org, repo string) *Dco {
 	return &Dco{}
 }
 
+// InvalidCommitMsgFor finds the InvalidCommitMsg configuration for a repo, if one exists.
+// A configuration can be listed for the repo itself or for the owning organization.
+func (c *Configuration) InvalidCommitMsgFor(org, repo string) *InvalidCommitMsg {
+	fullName := fmt.Sprintf("%s/%s", org, repo)
+	// Prioritize repo level triggers over org level triggers.
+	for _, cfg := range c.InvalidCommitMsg {
+		if !sets.New[string](cfg.Repos...).Has(fullName) {
+			continue
+		}
+		return &cfg
+	}
+	// If you don't find anything, loop again looking for an org config
+	for _, cfg := range c.InvalidCommitMsg {
+		if !sets.New[string](cfg.Repos...).Has(org) {
+			continue
+		}
+		return &cfg
+	}
+
+	return &InvalidCommitMsg{}
+}
+
 func OldToNewPlugins(oldPlugins map[string][]string) Plugins {
 	newPlugins := make(Plugins)
 	for repo, plugins := range oldPlugins {
@@ -1432,6 +1526,31 @@ func validateTrigger(triggers []Trigger) error {
 	return nil
 }
 
+var validInvalidCommitMsgChecks = sets.New[string]("fixupPrefix", "issueClosingKeywords")
+
+func validateInvalidCommitMsg(cfgs []InvalidCommitMsg) error {
+	var errs []error
+	for i, cfg := range cfgs {
+		for _, repo := range cfg.Repos {
+			if strings.TrimSpace(repo) == "" {
+				errs = append(errs, fmt.Errorf(
+					"error validating invalid_commit_msg config #%d: repo %q must be of form org or org/repo", i, repo))
+			}
+		}
+		for j, check := range cfg.Checks {
+			if strings.TrimSpace(check.Name) == "" {
+				errs = append(errs, fmt.Errorf(
+					"error validating invalid_commit_msg config #%d check #%d: check name cannot be empty", i, j))
+			} else if !validInvalidCommitMsgChecks.Has(check.Name) {
+				errs = append(errs, fmt.Errorf(
+					"error validating invalid_commit_msg config #%d check #%d: unknown check name %q (valid: %v)",
+					i, j, check.Name, sets.List(validInvalidCommitMsgChecks)))
+			}
+		}
+	}
+	return utilerrors.NewAggregate(errs)
+}
+
 var warnRepoMilestone time.Time
 
 func validateRepoMilestone(milestones map[string]Milestone) {
@@ -1545,6 +1664,12 @@ func (c *Configuration) Validate() error {
 		return err
 	}
 	if err := validateRepoDupes(c.Welcome); err != nil {
+		return err
+	}
+	if err := validateInvalidCommitMsg(c.InvalidCommitMsg); err != nil {
+		return err
+	}
+	if err := validateRepoDupes(c.InvalidCommitMsg); err != nil {
 		return err
 	}
 	validateRepoMilestone(c.RepoMilestone)

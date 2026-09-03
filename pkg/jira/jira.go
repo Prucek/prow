@@ -95,6 +95,10 @@ type Client interface {
 	Used() bool
 	WithFields(fields logrus.Fields) Client
 	GetProjectVersions(project string) ([]*jira.Version, error)
+	AddWatcher(issueID, userName string) error
+	AddWatcherWithContext(ctx context.Context, issueID, userName string) error
+	GetWatchers(issueID string) (*[]jira.User, error)
+	GetWatchersWithContext(ctx context.Context, issueID string) (*[]jira.User, error)
 }
 
 type BasicAuthGenerator func() (username, password string)
@@ -523,10 +527,14 @@ func CloneIssue(jc Client, parent *jira.Issue) (*jira.Issue, error) {
 	// update description
 	childIssue.Fields.Description = fmt.Sprintf("This is a clone of issue %s. The following is the description of the original issue: \n---\n%s", parent.Key, parent.Fields.Description)
 
-	// attempt to create the new issue
-	createdIssue, err := jc.CreateIssue(childIssue)
-	if err != nil {
-		// some fields cannot be set on creation; unset them
+	// attempt to create the new issue; some fields cannot be set on creation,
+	// and Jira may report them across multiple attempts, so retry in a loop
+	var createdIssue *jira.Issue
+	for range 5 {
+		createdIssue, err = jc.CreateIssue(childIssue)
+		if err == nil {
+			break
+		}
 		if JiraErrorStatusCode(err) != 400 {
 			return nil, err
 		}
@@ -538,10 +546,9 @@ func CloneIssue(jc Client, parent *jira.Issue) (*jira.Issue, error) {
 			// unsetProblematicFields is not useful in these cases
 			return nil, err
 		}
-		createdIssue, err = jc.CreateIssue(childIssue)
-		if err != nil {
-			return nil, err
-		}
+	}
+	if err != nil {
+		return nil, err
 	}
 
 	// create clone links
@@ -901,4 +908,49 @@ func (jc *client) GetProjectVersions(project string) ([]*jira.Version, error) {
 		return nil, HandleJiraError(resp, err)
 	}
 	return versions, nil
+}
+
+func (jc *client) GetWatchers(issueID string) (*[]jira.User, error) {
+	return jc.GetWatchersWithContext(context.Background(), issueID)
+}
+
+func (jc *client) GetWatchersWithContext(ctx context.Context, issueID string) (*[]jira.User, error) {
+	watchers, response, err := jc.upstream.Issue.GetWatchersWithContext(ctx, issueID)
+	if err != nil {
+		if response != nil && response.StatusCode == http.StatusNotFound {
+			return nil, NotFoundError{err}
+		}
+		return nil, HandleJiraError(response, err)
+	}
+	return watchers, nil
+}
+
+func (jc *client) AddWatcher(issueID, userName string) error {
+	return jc.AddWatcherWithContext(context.Background(), issueID, userName)
+}
+
+func (jc *client) AddWatcherWithContext(ctx context.Context, issueID, userName string) error {
+	response, err := jc.upstream.Issue.AddWatcherWithContext(ctx, issueID, userName)
+	if err != nil {
+		if response != nil && response.StatusCode == http.StatusNotFound {
+			return NotFoundError{err}
+		}
+		return HandleJiraError(response, err)
+	}
+	return nil
+}
+
+func (jc *client) RemoveWatcher(issueID, userName string) error {
+	return jc.RemoveWatcherWithContext(context.Background(), issueID, userName)
+}
+
+func (jc *client) RemoveWatcherWithContext(ctx context.Context, issueID, userName string) error {
+	response, err := jc.upstream.Issue.RemoveWatcherWithContext(ctx, issueID, userName)
+	if err != nil {
+		if response != nil && response.StatusCode == http.StatusNotFound {
+			return NotFoundError{err}
+		}
+		return HandleJiraError(response, err)
+	}
+	return nil
 }
